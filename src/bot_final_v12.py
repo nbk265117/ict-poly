@@ -25,21 +25,19 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime
-import requests
-import time
+import os
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Path to local data directory
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
+
 CONFIG = {
     # Pairs
-    'pairs': {
-        'BTC': 'BTCUSDT',
-        'ETH': 'ETHUSDT',
-        'XRP': 'XRPUSDT'
-    },
+    'pairs': ['BTC', 'ETH', 'XRP'],
 
     # Trading
     'bet_size': 327,        # $327 par trade
@@ -79,54 +77,26 @@ class ICTHybridBot:
 
     def __init__(self, config=CONFIG):
         self.config = config
-        self.base_url = "https://api.binance.com"
-        self.session = requests.Session()
         self.data_cache = {}
 
-    def fetch_data(self, symbol, interval, start_ts, end_ts):
-        """Télécharge les données depuis Binance"""
-        cache_key = f"{symbol}_{interval}_{start_ts}_{end_ts}"
+    def load_data(self, pair, interval):
+        """Charge les données depuis les fichiers CSV locaux"""
+        cache_key = f"{pair}_{interval}"
         if cache_key in self.data_cache:
             return self.data_cache[cache_key]
 
-        all_data = []
-        current = start_ts
-
-        while current < end_ts:
-            params = {
-                "symbol": symbol,
-                "interval": interval,
-                "startTime": current,
-                "endTime": end_ts,
-                "limit": 1000
-            }
-            try:
-                r = self.session.get(f"{self.base_url}/api/v3/klines", params=params, timeout=30)
-                data = r.json()
-                if not data or isinstance(data, dict):
-                    break
-                all_data.extend(data)
-                current = data[-1][0] + 1
-                time.sleep(0.02)
-            except:
-                time.sleep(0.5)
-                continue
-
-        if not all_data:
+        file_path = os.path.join(DATA_DIR, f"{pair}_{interval}.csv")
+        if not os.path.exists(file_path):
+            print(f"  Warning: {file_path} not found")
             return pd.DataFrame()
 
-        df = pd.DataFrame(all_data, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'
-        ])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = df[col].astype(float)
-        df.set_index('timestamp', inplace=True)
-        result = df[['open', 'high', 'low', 'close', 'volume']]
+        df = pd.read_csv(file_path, index_col=0, parse_dates=True)
+        self.data_cache[cache_key] = df
+        return df
 
-        self.data_cache[cache_key] = result
-        return result
+    def get_data_slice(self, df, start_dt, end_dt):
+        """Extrait une portion des données entre deux dates"""
+        return df[(df.index >= start_dt) & (df.index < end_dt)]
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  INDICATEURS
@@ -252,7 +222,7 @@ class ICTHybridBot:
 def run_backtest():
     """Backtest complet avec configuration finale"""
     print("=" * 85)
-    print("  ICT HYBRID V12 - BACKTEST FINAL")
+    print("  ICT HYBRID V12 - BACKTEST FINAL (LOCAL DATA)")
     print("  Config: RSI 45/55 | Stoch 42/58 | FTFC 1.5 | $327/trade")
     print("=" * 85)
 
@@ -264,6 +234,17 @@ def run_backtest():
     PAYOUT = cfg['payout']
     COOLDOWN = cfg['cooldown']
 
+    # Load all data upfront
+    print(f"\n  Loading local data from {DATA_DIR}...")
+    data = {}
+    for pair in PAIRS:
+        data[pair] = {
+            '15m': bot.load_data(pair, '15m'),
+            '1h': bot.load_data(pair, '1h'),
+            '4h': bot.load_data(pair, '4h')
+        }
+        print(f"    {pair}: {len(data[pair]['15m']):,} candles (15m)")
+
     periods = []
     for year in [2024, 2025]:
         for month in range(1, 13):
@@ -272,7 +253,7 @@ def run_backtest():
             periods.append((f"{year}-{month:02d}", start, end))
 
     print(f"\n  Configuration:")
-    print(f"    Pairs: {', '.join(PAIRS.keys())}")
+    print(f"    Pairs: {', '.join(PAIRS)}")
     print(f"    Bet Size: ${BET}/trade")
     print(f"    Payout: {PAYOUT*100}%")
     print(f"    RSI({cfg['rsi_period']}): {cfg['rsi_oversold']}/{cfg['rsi_overbought']}")
@@ -294,19 +275,17 @@ def run_backtest():
         if end_dt > datetime.now():
             end_dt = datetime.now()
 
-        start_ts = int(start_dt.timestamp() * 1000)
-        end_ts = int(end_dt.timestamp() * 1000)
         days = (end_dt - start_dt).days
 
         month_trades = 0
         month_wins = 0
         month_pnl = 0
 
-        for name, symbol in PAIRS.items():
+        for pair in PAIRS:
             try:
-                df_15m = bot.fetch_data(symbol, "15m", start_ts, end_ts)
-                df_1h = bot.fetch_data(symbol, "1h", start_ts, end_ts)
-                df_4h = bot.fetch_data(symbol, "4h", start_ts, end_ts)
+                df_15m = bot.get_data_slice(data[pair]['15m'], start_dt, end_dt)
+                df_1h = bot.get_data_slice(data[pair]['1h'], start_dt, end_dt)
+                df_4h = bot.get_data_slice(data[pair]['4h'], start_dt, end_dt)
 
                 if len(df_15m) < 100 or len(df_1h) < 50 or len(df_4h) < 20:
                     continue
@@ -431,6 +410,11 @@ def run_backtest():
     print("\n" + "=" * 85)
 
     return all_results
+
+
+def run():
+    """Alias for run_backtest"""
+    return run_backtest()
 
 
 if __name__ == "__main__":
